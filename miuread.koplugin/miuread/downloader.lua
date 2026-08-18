@@ -59,6 +59,90 @@ local function css_add(list, seen, css)
     if css ~= "" and not seen[css] then seen[css] = true; list[#list + 1] = css end
 end
 
+-- 段首缩进策略：网文类源文本的每个 <p> 自带两个全角空格，而 CRE 对 U+3000
+-- 的渲染宽度随字体变化（从半字宽到整字宽都出现过），任何固定的
+-- text-indent 补偿都只对某个字体正确。打包时把段首全角空格包进隐藏
+-- span——只加标记、不改动任何文字字节，微信读书云端坐标（划线、精确
+-- 进度）建立在原始文本上，批注定位的文本索引本来就忽略全角空格，因此
+-- 不受影响。统一用 2em 缩进后，任何字体、任何 KOReader 版本下首行都
+-- 正好两个全字。
+local U3000 = "\227\128\128"
+local MIU_LEAD_OPEN = '<span class="miu-lead">'
+local INDENT_MIN_SAMPLE = 10
+local INDENT_SAMPLE_LIMIT = 400
+local INDENT_WRAP_MAX_BYTES = 8 * 1024 * 1024
+
+local function wrap_indent_spaces(body)
+    local wrapped = 0
+    local out
+    out, wrapped = body:gsub("(<p>)(" .. U3000 .. "+)", function(open, spaces)
+        return open .. MIU_LEAD_OPEN .. spaces .. "</span>"
+    end)
+    local extra
+    out, extra = out:gsub("(<p%s[^>]*>)(" .. U3000 .. "+)", function(open, spaces)
+        return open .. MIU_LEAD_OPEN .. spaces .. "</span>"
+    end)
+    return out, wrapped + extra
+end
+
+local function apply_paragraph_indent(chapters)
+    local total, wrapped = 0, 0
+    for _, chapter in ipairs(chapters or {}) do
+        if total < INDENT_SAMPLE_LIMIT then
+            local sample
+            if chapter.body_path then
+                local file = io.open(chapter.body_path, "rb")
+                if file then sample = file:read(64 * 1024) or "" file:close() end
+            else
+                local body = tostring(chapter.body or "")
+                sample = #body > 64 * 1024 and body:sub(1, 64 * 1024) or body
+            end
+            if sample and sample ~= "" then
+                local _, plain = sample:gsub("<p>", "")
+                local _, attr = sample:gsub("<p%s", "")
+                local _, lead = sample:gsub('<span class="miu%-lead">', "")
+                wrapped = wrapped + lead
+                total = total + plain + attr
+            end
+        end
+        -- 逐章包裹段首空格；写回断点文件使下次扩展直接复用（幂等）。
+        local body, from_file
+        if chapter.body_path then
+            local file = io.open(chapter.body_path, "rb")
+            if file then body = file:read("*a") file:close() end
+            from_file = body ~= nil
+        else
+            body = tostring(chapter.body or "")
+            if body == "" then body = nil end
+        end
+        if body and #body <= INDENT_WRAP_MAX_BYTES then
+            local out, count = wrap_indent_spaces(body)
+            if count > 0 then
+                wrapped = wrapped + count
+                if from_file then
+                    local ok = U.atomic_write(chapter.body_path, out, true)
+                    if not ok then
+                        logger.warn("[MiuRead][Download] indent wrap write failed",
+                            tostring(chapter.body_path))
+                    end
+                else
+                    chapter.body = out
+                end
+            end
+        end
+    end
+    if total < INDENT_MIN_SAMPLE then return "" end
+    local rule = "\np { text-indent: 2em !important; }\n"
+        .. ".miu-image-only-item { text-indent: 0 !important; }\n"
+    if wrapped > 0 then
+        rule = "\n.miu-lead { display: none !important; font-size: 0.01em !important; }\n"
+            .. rule
+    end
+    logger.info("[MiuRead][Download] paragraph indent applied",
+        "paragraphs=", tostring(total), "wrapped=", tostring(wrapped))
+    return rule
+end
+
 local function plain(value)
     return tostring(value or ""):gsub("<[^>]+>", " "):gsub("&[%#%w]+;", " "):gsub("%s+", " ")
 end
@@ -957,6 +1041,11 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     opt.image_summary.embedded=math.max(tonumber(opt.image_summary.embedded or 0) or 0,
         tonumber(resource_stats.embedded or 0) or 0)
     opt.image_summary.assets=#assets
+
+    local indent_rule=apply_paragraph_indent(chapters)
+    if indent_rule~="" then
+        css=tostring(css or "")..indent_rule
+    end
 
     local stamp=tostring(opt.download_run_id or os.time()):gsub("[^%w%-]","-")
     local temp_path=path:gsub("%.epub$","")..".miuread-new-"..stamp..".epub"

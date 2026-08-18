@@ -1764,6 +1764,21 @@ function Plugin:current_book_download_menu(book)
     if self:_has_range_variant(book.bookId) then
         items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(book) end}
     end
+    local book_id=tostring(book and (book.bookId or book.book_id) or "")
+    if book_id~="" then
+        items[#items+1]={
+            text="追读模式",
+            checked_func=function() return self:_serial_flags(book_id).auto_prefetch end,
+            keep_menu_open=true,
+            callback=function()
+                local flags=self:_serial_flags(book_id)
+                local enabled=not flags.auto_prefetch
+                self:_serial_set_enabled(book_id,enabled,flags.annotations)
+                self:toast(enabled and "追读已开启：剩余章节不足时自动下载后续章节" or "追读已关闭",3)
+                if enabled then self:_schedule_serial_prefetch_check(true) end
+            end,
+        }
+    end
     return items
 end
 
@@ -7393,6 +7408,9 @@ function Plugin:_show_home_book_open_popup(book,anchor)
         title=tostring(target.title or "书籍"),
         subtitle=(same_failed or partial) and "下载尚未完整" or "这本书尚未下载",
         actions={
+            {icon="▶",label="追读这本书",detail="先下前几章，阅读时自动续下",callback=function()
+                self:start_serial_reading(target)
+            end},
             {icon="⇩",label=label,detail=(same_failed or partial) and "继续现有任务，必要时重新生成" or "加入下载任务",callback=function()
                 self:choose_download(target,nil,false)
             end},
@@ -8704,10 +8722,12 @@ end
 function Plugin:_show_home_remote_book_more(book,anchor)
     local target=U.copy(book or {})
     local id=tostring(target.bookId or target.book_id or "")
-    local actions={
-        {icon="⇩",label="生成／更新书籍",detail="重新生成或更新 EPUB",callback=function() self:choose_download(target,nil,false) end},
-        {icon="▤",label="按章节下载",detail="选择章节后生成",callback=function() self:chapters(target) end},
-    }
+    local actions={}
+    if not (self:_variant_exists(id,"clean") or self:_variant_exists(id,"notes")) then
+        actions[#actions+1]={icon="▶",label="追读这本书",detail="先下前几章，阅读时自动续下",callback=function() self:start_serial_reading(target) end}
+    end
+    actions[#actions+1]={icon="⇩",label="生成／更新书籍",detail="重新生成或更新 EPUB",callback=function() self:choose_download(target,nil,false) end}
+    actions[#actions+1]={icon="▤",label="按章节下载",detail="选择章节后生成",callback=function() self:chapters(target) end}
     if id~="" and self:_has_range_variant(id) then
         actions[#actions+1]={icon="＋",label="扩展已有章节版",detail="继续增加章节范围",callback=function()
             self:_show_home_bubble_menu("扩展已有章节版",self:range_extend_menu(target),{anchor=anchor,preferred_direction="above",page_size=7})
@@ -11393,6 +11413,17 @@ function Plugin:_reader_typography_apply(generation)
     end
 
     if task and task:busy() and not task:is_hibernated() then
+        local runtime=self._download_runtime
+        if runtime and type(runtime.options)=="table" and runtime.options.auto_prefetch==true
+            and type(task.cancel)=="function" then
+            -- 追读的自动扩展是可再生的后台任务：用户的排版调整优先。取消
+            -- 本次扩展（章节断点保留），下一轮追读检查会自动从断点续上。
+            logger.info("[MiuRead][Typography] cancelling auto prefetch for immediate apply")
+            task:cancel()
+            pending.guard_mode=nil
+            pending.guard_started_clock=monotonic_wall_time()
+            return self:_reader_typography_wait_for_guard(generation,pending.guard_started_clock,nil)
+        end
         local hibernate_line=math.max(1,tonumber(Config.TYPOGRAPHY_HIBERNATE_MEMORY_KB) or 72*1024)
         local stage=tostring(task:stage() or "unknown")
         if typography_heavy_stage(stage) or (available and available<hibernate_line) then
@@ -11575,6 +11606,13 @@ end
 function Plugin:_show_reader_toc(back_callback)
     local items=self:_reader_toc_items()
     if #items>0 then
+        -- 首行固定提供全书目录入口：章节版/单章文件的文档目录只覆盖已下载
+        -- 章节，全书目录可以跳转或按需追读任意章节。
+        table.insert(items,1,{
+            title="全书目录（含未下载章节）",
+            depth=1,
+            callback=function() self:_show_full_catalog_toc(back_callback) end,
+        })
         self:_mark_reader_busy(6)
         local dialog,err=ReaderTocDialog.show{
             title="目录",
@@ -11585,6 +11623,9 @@ function Plugin:_show_reader_toc(back_callback)
         }
         if dialog then return true end
         logger.warn("[MiuRead][ReaderToc] custom dialog unavailable",tostring(err or "unknown"))
+    end
+    if self:_reader_session_is_weread() and self:_current_book_record() then
+        return self:_show_full_catalog_toc(back_callback)
     end
     -- A native full-screen ToC is an acceptable compatibility fallback; it is
     -- intentionally different from the native bottom configuration strip.
@@ -11598,6 +11639,129 @@ function Plugin:_show_reader_toc(back_callback)
     end
     self:info("当前书籍没有可用目录")
     return false
+end
+
+local function catalog_title_key(value)
+    return (tostring(value or ""):gsub("[%s%p%c]",""))
+end
+
+function Plugin:_full_catalog_rows(record)
+    local book_id=tostring(record and record.book and (record.book.book_id or record.book.bookId) or "")
+    if book_id=="" then return nil end
+    local book=self.store:book(book_id)
+    local catalog=type(book)=="table" and type(book.catalog)=="table" and book.catalog or {}
+    if #catalog==0 then return nil end
+    -- 历史下载曾把“本范围章节表”当作整书目录保存（下载子进程在设置临时
+    -- 副本上运行，完整目录回不到主库）。范围版记录的 catalog_count 也是本
+    -- 范围章数，不能当完整性依据；只有覆盖到当前文件最后一章的目录才算
+    -- 完整，否则交给调用方走联网补取并回填。
+    local map=type(record.record and record.record.chapter_map)=="table" and record.record.chapter_map or {}
+    local last_global=tonumber(map[#map] and map[#map].index) or 0
+    if last_global>0 and #catalog<last_global then return nil end
+    return catalog
+end
+
+function Plugin:_reader_jump_to_chapter(row,record)
+    local items=self:_reader_toc_items()
+    local wanted=catalog_title_key(row and row.title)
+    local map=type(record.record and record.record.chapter_map)=="table" and record.record.chapter_map or {}
+    local target,depth1=nil,nil
+    for _,item in ipairs(items) do
+        if (tonumber(item.depth) or 1)==1 then
+            depth1=(depth1 or 0)+1
+            if not target and catalog_title_key(item.title)==wanted and wanted~="" then target=item end
+        end
+    end
+    if not target then
+        -- 标题没匹配上时按章节在文件内的顺序号定位（深度 1 的目录条目
+        -- 与文件章节一一对应）。
+        local ordinal
+        local wanted_index=tonumber(row and row.index)
+        if wanted_index then
+            for i,mrow in ipairs(map) do
+                if tonumber(mrow.index)==wanted_index then ordinal=i; break end
+            end
+        end
+        if ordinal and depth1 and ordinal<=depth1 then
+            local count=0
+            for _,item in ipairs(items) do
+                if (tonumber(item.depth) or 1)==1 then
+                    count=count+1
+                    if count==ordinal then target=item; break end
+                end
+            end
+        end
+    end
+    if target and type(target.callback)=="function" then return target.callback() end
+    self:toast("没有在当前文件中找到这一章",2)
+    return false
+end
+
+function Plugin:_show_full_catalog_toc(back_callback)
+    local r=self:_current_book_record()
+    if not r or not r.book then self:info("当前不是觅阅生成的书籍。") return false end
+    local book_id=tostring(r.book.book_id or r.book.bookId or "")
+    local b={bookId=book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
+    local function show(rows)
+        rows=rows or {}
+        if #rows==0 then self:info("暂时无法获取全书目录，请稍后再试。") return false end
+        self:_mark_reader_busy(6)
+        local map=type(r.record.chapter_map)=="table" and r.record.chapter_map or {}
+        local in_file={}
+        for _,mrow in ipairs(map) do in_file[tostring(mrow.uid or "")]=true end
+        local ratio=self.sync:local_ratio() or 0
+        local current_uid=""
+        local ok_pos,position=pcall(self.sync.position,self.sync,r,ratio,map)
+        if ok_pos and type(position)=="table" then current_uid=tostring(position.chapter_uid or "") end
+        local items={}
+        for index,row in ipairs(rows) do
+            local uid=tostring(row.uid or row.chapterUid or "")
+            local downloaded=in_file[uid]==true
+            items[#items+1]={
+                title=tostring(row.title or ("第 "..index.." 章")),
+                depth=1,
+                page_label=downloaded and "已下载" or nil,
+                current=uid~="" and uid==current_uid,
+                callback=function()
+                    if downloaded then return self:_reader_jump_to_chapter(row,r) end
+                    self:_serial_begin(b,rows,index,self:_serial_flags(book_id).annotations)
+                    return true
+                end,
+            }
+        end
+        local dialog,err=ReaderTocDialog.show{
+            title="全书目录 · "..tostring(r.book.title or "未命名"),
+            items=items,
+            auto_follow=true,
+            on_back=back_callback or function() self:_show_reader_toc() end,
+            on_home=function() return self:return_to_miuread_home("reader surface") end,
+        }
+        if dialog then return true end
+        logger.warn("[MiuRead][ReaderToc] full catalog dialog unavailable",tostring(err or "unknown"))
+        self:info("全书目录暂时无法打开。")
+        return false
+    end
+    local cached=self:_full_catalog_rows(r)
+    if cached then return show(cached) end
+    if not self:require_login() then return false end
+    if not self:is_online() then self:info("全书目录需要联网获取一次，之后可离线使用。") return false end
+    local context=self:_interactive_network_context()
+    return self:_request_catalog(b,"full-toc",function(fetched)
+        fetched=fetched or {}
+        if #fetched==0 then return end
+        local normalized={}
+        for index,row in ipairs(fetched) do
+            normalized[#normalized+1]={
+                uid=tostring(row.chapterUid or row.uid or ""),
+                index=tonumber(row.chapterIdx or row.index) or index,
+                title=row.title,
+                word_count=tonumber(row.wordCount or row.word_count) or 0,
+                structural=row.structural==true,
+            }
+        end
+        self.store:save_book(book_id,{book_id=book_id,catalog=normalized,updated_at=os.time()})
+        show(normalized)
+    end,{context=context,status_text="正在读取全书目录…"})
 end
 
 function Plugin:_reader_line_spacing_value()
@@ -11658,9 +11822,59 @@ function Plugin:_reader_adjust_font_weight(delta)
     return self:_reader_set_font_weight(self:_reader_font_weight_value()+(tonumber(delta) or 0))
 end
 
+function Plugin:_reader_font_face_list_from_engine()
+    -- 直接向 CRE 引擎要字体列表，绕开任何绑定旧实例的缓存结构。
+    local ok_doc,credocument=pcall(require,"document/credocument")
+    if not ok_doc or type(credocument)~="table" then return nil end
+    local ok_engine,cre=pcall(function()
+        if type(credocument.engineInit)=="function" then return credocument:engineInit() end
+        return credocument
+    end)
+    if not ok_engine or type(cre)~="table" or type(cre.getFontFaces)~="function" then return nil end
+    local ok_faces,faces=pcall(cre.getFontFaces,cre)
+    if ok_faces and type(faces)=="table" and #faces>0 then return faces end
+    return nil
+end
+
+function Plugin:_show_reader_font_face_list(faces,back_callback)
+    local rows={}
+    for _,face in ipairs(faces) do
+        face=tostring(face or "")
+        if face~="" then
+            rows[#rows+1]={
+                text=face,
+                radio=true,
+                checked_func=function()
+                    local current=self.ui and self.ui.font
+                    return current~=nil and current.font_face==face
+                end,
+                callback=function()
+                    local current=self.ui and self.ui.font
+                    if not current then self:info("当前文档暂时无法选择字体") return end
+                    self:_mark_reader_busy(6)
+                    local ok=pcall(current.onSetFont,current,face)
+                    if ok and type(current.addToRecentlySelectedList)=="function" then
+                        pcall(current.addToRecentlySelectedList,current,face)
+                    end
+                    self:status_toast("字体","已切换为 "..face,2)
+                end,
+            }
+        end
+    end
+    if #rows==0 then return false end
+    return self:_show_reader_menu_table("正文字体",rows,back_callback)
+end
+
 function Plugin:_show_reader_font_face_menu(back_callback)
     local font=self.ui and self.ui.font or nil
     if not font then self:info("当前文档暂时无法选择字体"); return false end
+    -- KOReader 字体列表（face_table）的回调闭包绑定构建时的 ReaderFont 实例；
+    -- 书籍重开（追读自动续读、切换文档）后旧实例失效，点选会静默无效。
+    -- 优先使用自建列表，回调在点击时对“当前”实例应用。
+    local faces=self:_reader_font_face_list_from_engine()
+    if faces then
+        return self:_show_reader_font_face_list(faces,back_callback)
+    end
     if type(font.setupFaceMenuTable)=="function" then pcall(font.setupFaceMenuTable,font) end
     local items=font.face_table
     if type(items)=="table" and #items>0 then
@@ -16063,6 +16277,9 @@ function Plugin:book_menu(b)
         end
     end
     items[#items+1]={text="生成／更新书籍",callback=function() self:choose_download(b,nil,false) end}
+    if not (self:_variant_exists(b.bookId,"clean") or self:_variant_exists(b.bookId,"notes")) then
+        items[#items+1]={text="追读这本书",callback=function() self:start_serial_reading(b) end}
+    end
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
     if self:_has_range_variant(b.bookId) then
         items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
@@ -16338,7 +16555,10 @@ function Plugin:_finish_download_runtime(runtime,result)
             self.store:clear_download_state()
             self:_update_open_shelf_download_status(b.bookId,"生成已取消")
             self:_notify_home_data_changed("content")
-            if was_background then self:status_toast("觅阅","下载已取消",3) else self:toast("下载已取消",3) end
+            -- 追读自动扩展被排版让路取消时保持安静；断点保留且稍后自动续上。
+            if opt.auto_prefetch~=true then
+                if was_background then self:status_toast("觅阅","下载已取消",3) else self:toast("下载已取消",3) end
+            end
             self:_start_next_queued_download()
             return
         end
@@ -16454,12 +16674,27 @@ function Plugin:_finish_download_runtime(runtime,result)
         self.store:clear_download_state()
     end
     self:_notify_home_data_changed("content")
+    -- 追读扩展完成且用户正读到同一文件的末尾：立即尝试自动续读。
+    if opt.auto_prefetch==true and rec.pending_install==true
+        and tostring(self:_current_document_path() or "")==tostring(rec.file or "") then
+        UIManager:scheduleIn(1.0,function()
+            if self._serial_continue_active==true then return end
+            self._serial_prefetch_next_at=nil
+            self:_serial_prefetch_check()
+        end)
+    end
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
+    -- 追读的静默扩展不打扰阅读：完成提示只在批注有遗留问题时提醒。
+    local serial_silent=opt.auto_prefetch==true and annotation_pending~=true and annotation_fallback~=true
     if pending then
-        local text=DownloadResult.notice(b.title,rec,true)
-        if was_background then self:status_toast("觅阅",text,5) else self:info(text) end
+        if not serial_silent then
+            local text=DownloadResult.notice(b.title,rec,true)
+            if was_background then self:status_toast("觅阅",text,5) else self:info(text) end
+        end
     elseif was_background then
-        if self.store:preferences().download_complete_notice~=false or annotation_pending or annotation_fallback then
+        if not serial_silent
+            and (self.store:preferences().download_complete_notice~=false
+                or annotation_pending or annotation_fallback) then
             self:status_toast("觅阅",DownloadResult.notice(b.title,rec,false),5)
         end
     elseif open_after and rec.file then
@@ -17206,6 +17441,340 @@ function Plugin:download_current_chapters(count)
         local last=math.min(#rows,first+wanted-1)
         self:_choose_range_version(b,rows,first,last,false)
     end,{context=context,status_text="正在后台定位当前章节…"})
+end
+
+-- ---------------------------------------------------------------------------
+-- 追读：阅读章节版/单章文件时自动向后预下载，不再手动指定范围。
+-- 起步通过 start_serial_reading 下载一个小范围并打开；阅读中的检查只做
+-- 本地计算，剩余可读章数不足时静默扩展范围（复用断点，只下新章节）。
+-- ---------------------------------------------------------------------------
+
+function Plugin:_serial_read_config()
+    return {
+        start_count=math.max(2,tonumber(Config.SERIAL_READ_START_CHAPTERS) or 5),
+        keep_ahead=math.max(1,tonumber(Config.SERIAL_READ_KEEP_AHEAD) or 3),
+        batch=math.max(1,tonumber(Config.SERIAL_READ_EXTEND_BATCH) or 5),
+        check_interval=math.max(3,tonumber(Config.SERIAL_READ_CHECK_INTERVAL) or 10),
+    }
+end
+
+function Plugin:_serial_set_enabled(book_id,enabled,annotations)
+    book_id=tostring(book_id or "")
+    if book_id=="" then return end
+    self.store:reload()
+    -- save_book 是字段合并，关闭时必须写 false 而不是 nil 才能覆盖旧值。
+    self.store:save_book(book_id,{
+        book_id=book_id,
+        auto_prefetch=enabled==true,
+        prefetch_annotations=annotations==true,
+        updated_at=os.time(),
+    })
+end
+
+function Plugin:_serial_flags(book_id)
+    local book=self.store:book(tostring(book_id or ""))
+    if type(book)~="table" then return {auto_prefetch=false,annotations=false} end
+    return {
+        auto_prefetch=book.auto_prefetch==true,
+        annotations=book.prefetch_annotations==true,
+    }
+end
+
+function Plugin:_serial_notice(key,seconds,title,text)
+    local now=monotonic_wall_time()
+    local state=self._serial_notices or {}
+    self._serial_notices=state
+    if now-(tonumber(state[key]) or 0)<(tonumber(seconds) or 30) then return end
+    state[key]=now
+    self:status_toast(title,text,3)
+end
+
+function Plugin:start_serial_reading(book)
+    local b=U.copy(book or {})
+    local id=tostring(b.bookId or b.book_id or "")
+    if id=="" then self:info("这本书缺少可下载的图书编号。") return end
+    if Protocol.is_mp_account(id) then self:info("公众号内容暂不支持追读。") return end
+    if not self:require_login() then return end
+    if not self:is_online() then self:info("当前没有网络连接，联网后再开启追读。") return end
+    if self:_variant_exists(id,"clean") or self:_variant_exists(id,"notes") then
+        self:info("这本书已有完整版本，直接打开即可，无需追读。\n\n如需重新生成，请使用“生成／更新书籍”。")
+        return
+    end
+    b.bookId=id
+    local dialog
+    local function pick_version(start_mode)
+        if dialog then UIManager:close(dialog); dialog=nil end
+        local version_dialog
+        version_dialog=ButtonDialog:new{
+            title="追读使用哪个版本？\n\n划线与想法版需要逐章获取批注，速度明显更慢。",
+            title_align="center",
+            buttons={
+                {{text="纯净版（更快）",callback=function()
+                    UIManager:close(version_dialog)
+                    self:_serial_prepare_start(b,start_mode,false)
+                end}},
+                {{text="划线与想法版",callback=function()
+                    UIManager:close(version_dialog)
+                    self:_serial_prepare_start(b,start_mode,true)
+                end}},
+                {{text="取消",callback=function() UIManager:close(version_dialog) end}},
+            },
+        }
+        UIManager:show(version_dialog)
+    end
+    dialog=ButtonDialog:new{title="从哪里开始追读《"..U.utf8_truncate(tostring(b.title or "未命名"),12).."》？",title_align="center",buttons={
+        {{text="云端进度（推荐）",callback=function() pick_version("cloud") end}},
+        {{text="第 1 章",callback=function() pick_version("first") end}},
+        {{text="从目录选择",callback=function() pick_version("toc") end}},
+        {{text="取消",callback=function() UIManager:close(dialog) end}},
+    }}
+    UIManager:show(dialog)
+end
+
+function Plugin:_serial_cloud_start_index(rows,remote)
+    if type(remote)~="table" then return nil end
+    local uid=tostring(remote.chapter_uid or remote.chapterUid or "")
+    if uid~="" then
+        for index,chapter in ipairs(rows or {}) do
+            if tostring(chapter.chapterUid or chapter.uid or "")==uid then return index end
+        end
+    end
+    local idx=tonumber(remote.chapter_idx or remote.chapterIdx)
+    if idx then
+        if rows[idx] then return idx end
+        for index,chapter in ipairs(rows or {}) do
+            local ci=tonumber(chapter.chapterIdx or chapter.index)
+            if ci and ci==idx then return index end
+        end
+    end
+    local percent=tonumber(remote.percent)
+    if percent and percent>1 then percent=percent/100 end
+    if percent and percent>0 then
+        local total=0
+        for _,chapter in ipairs(rows or {}) do
+            total=total+math.max(1,tonumber(chapter.wordCount or chapter.word_count) or 1)
+        end
+        if total>0 then
+            local target=percent*total
+            local acc=0
+            for index,chapter in ipairs(rows or {}) do
+                acc=acc+math.max(1,tonumber(chapter.wordCount or chapter.word_count) or 1)
+                if acc>=target then return index end
+            end
+            return #rows
+        end
+    end
+    return nil
+end
+
+function Plugin:_serial_prepare_start(b,start_mode,annotations)
+    local context=self:_interactive_network_context()
+    self:_request_catalog(b,"serial-start",function(rows)
+        rows=rows or {}
+        if #rows==0 then self:info("暂时无法读取章节目录，请稍后再试。") return end
+        if start_mode=="toc" then
+            self:_chapter_list_menu(b,rows,"追读起点 · 选择章节",function(_,chapter)
+                local index
+                local uid=tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
+                if uid~="" then
+                    for i,row in ipairs(rows) do
+                        if tostring(row.chapterUid or row.uid or "")==uid then index=i; break end
+                    end
+                end
+                if not index then index=tonumber(chapter and (chapter.chapterIdx or chapter.index)) or 1 end
+                self:_serial_begin(b,rows,index,annotations)
+            end)
+            return
+        end
+        if start_mode=="cloud" then
+            self:status_toast("追读","正在读取云端进度…",3)
+            self.sync:remote(b.bookId,function(remote)
+                local index=self:_serial_cloud_start_index(rows,remote)
+                if not index then
+                    self:status_toast("追读","云端进度暂不可用，从第 1 章开始",4)
+                    index=1
+                end
+                self:_serial_begin(b,rows,index,annotations)
+            end,{detached=true,catalog_snapshot=U.copy(rows)})
+            return
+        end
+        self:_serial_begin(b,rows,1,annotations)
+    end,{context=context,status_text="正在准备追读…"})
+end
+
+function Plugin:_serial_begin(b,rows,start_index,annotations)
+    local cfg=self:_serial_read_config()
+    start_index=math.max(1,math.min(#rows,tonumber(start_index) or 1))
+    local last=math.min(#rows,start_index+cfg.start_count-1)
+    self:_serial_set_enabled(b.bookId,true,annotations)
+    self:status_toast("追读","《"..U.utf8_truncate(tostring(b.title or "未命名"),14)
+        .."》已开启，先下载 "..tostring(last-start_index+1).." 章，之后自动续下",4)
+    logger.info("[MiuRead][SerialRead] started",
+        "book=",tostring(b.bookId),"start=",tostring(start_index),"end=",tostring(last),
+        "annotations=",tostring(annotations==true))
+    return self:choose_download_mode(b,{
+        annotations=annotations==true,
+        range_start_index=start_index,
+        range_end_index=last,
+        auto_prefetch=true,
+    },true)
+end
+
+function Plugin:_schedule_serial_prefetch_check(initial)
+    if not (self.ui and self.ui.document) then return end
+    if not self:_reader_session_is_weread() then return end
+    local cfg=self:_serial_read_config()
+    local now=monotonic_wall_time()
+    if initial~=true and now<(tonumber(self._serial_prefetch_next_at) or 0) then return end
+    self._serial_prefetch_next_at=now+cfg.check_interval
+    -- 翻页路径保持轻量：延迟到翻页刷新之后再做记录解析与存储读取。
+    UIManager:scheduleIn(initial==true and 2.0 or .4,function() self:_serial_prefetch_check() end)
+end
+
+function Plugin:_serial_prefetch_check()
+    if self._serial_continue_active==true then return end
+    if not (self.ui and self.ui.document) then return end
+    if not self:_reader_session_is_weread() then return end
+    if reader_close_active() then return end
+    local r=self:_current_book_record()
+    if not r or not r.book or not r.record then return end
+    local record=r.record
+    local standalone=tostring(record.chapter_uid or "")~=""
+    if record.partial_range~=true and not standalone then return end
+    local book_id=tostring(r.book.book_id or r.book.bookId or "")
+    if book_id=="" then return end
+    local flags=self:_serial_flags(book_id)
+    if not flags.auto_prefetch then return end
+    local map=type(record.chapter_map)=="table" and record.chapter_map or {}
+    if #map==0 then return end
+    local ratio=self.sync:local_ratio() or 0
+    local idx
+    local ok_pos,position=pcall(self.sync.position,self.sync,r,ratio,map)
+    if ok_pos and type(position)=="table" then
+        local uid=tostring(position.chapter_uid or "")
+        if uid~="" then
+            for i,row in ipairs(map) do
+                if tostring(row.uid or row.chapterUid or row.chapter_uid or "")==uid then idx=i; break end
+            end
+        end
+    end
+    if not idx then idx=math.max(1,math.min(#map,math.floor(ratio*#map)+1)) end
+    local current_global=tonumber(map[idx] and map[idx].index) or idx
+    local last_global=tonumber(map[#map] and map[#map].index) or #map
+    local at_last_chapter=current_global>=last_global
+    if at_last_chapter and ratio>=0.995 and self:_serial_pending_extension_for(r.path or record.file) then
+        self:_serial_reader_continue(book_id,r)
+        return
+    end
+    local cfg=self:_serial_read_config()
+    if last_global-current_global>=cfg.keep_ahead then return end
+    -- 全书章数只有当本地目录覆盖到当前文件末章时才可信。范围版记录的
+    -- catalog_count 是“本范围章数”（曾导致追读被误判为全书完成而自动关
+    -- 闭），绝不能当总数用；总数未知时交给下载端按真实目录截断。
+    local total
+    local book_entry=self.store:book(book_id)
+    if type(book_entry)=="table" and type(book_entry.catalog)=="table"
+        and #book_entry.catalog>0 and #book_entry.catalog>=last_global then
+        total=#book_entry.catalog
+    end
+    if total and last_global>=total then
+        self:_serial_set_enabled(book_id,false,flags.annotations)
+        self:status_toast("追读","《"..U.utf8_truncate(tostring(r.book.title or "未命名"),14)
+            .."》已全部下载，追读自动关闭",4)
+        return
+    end
+    if not self:is_online() or not self:logged_in() then return end
+    if (self.download_task and self.download_task:busy()) or self._download_runtime then
+        local runtime_id=tostring(self._download_runtime and self._download_runtime.book
+            and (self._download_runtime.book.bookId or self._download_runtime.book.book_id) or "")
+        if runtime_id==book_id and at_last_chapter and ratio>=0.9 then
+            self:_serial_notice("extending",30,"追读","后续章节正在下载…")
+        end
+        return
+    end
+    local state=self.store:download_state()
+    if state.status=="active" or state.status=="failed" or state.status=="interrupted" then return end
+    -- 唯一的等待位被占用时不抢占；本书已在等待则等它轮到即可。
+    if #self.store:download_queue()>0 then return end
+    local target_end=current_global+cfg.keep_ahead+cfg.batch
+    if total then target_end=math.min(target_end,total) end
+    if target_end<=last_global then return end
+    self:_serial_enqueue_extension(book_id,r,record,target_end,flags)
+end
+
+function Plugin:_serial_enqueue_extension(book_id,r,record,target_end,flags)
+    local b={bookId=book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
+    -- 范围版沿用原起点与 existing_range 断点合并；单章文件从下一章起新建范围版。
+    local start_index=tonumber(record.range_start_index)
+    if not start_index then
+        start_index=tonumber(record.chapter_map and record.chapter_map[1]
+            and record.chapter_map[1].index) or 1
+        if tostring(record.chapter_uid or "")~="" then start_index=start_index+1 end
+        if start_index>target_end then return end
+    end
+    local opt={
+        annotations=flags.annotations==true,
+        range_start_index=start_index,
+        range_end_index=target_end,
+        auto_prefetch=true,
+    }
+    logger.info("[MiuRead][SerialRead] extend",
+        "book=",tostring(book_id),"start=",tostring(start_index),"end=",tostring(target_end))
+    local policy=tostring(self.store:preferences().download_reader_policy or "ask")
+    if policy=="after_reading" and self:_active_reader_ui() then
+        local queued=self.store:enqueue_download({
+            key=self:_download_job_key(b,opt),
+            book=U.copy(b),options=U.copy(opt),open_after=false,
+            queued_at=os.time(),defer_until_reader_closed=true,
+            wait_reason="追读 · 退出阅读后下载",
+        })
+        if queued then self._serial_prefetch_next_at=nil end
+        return queued~=nil
+    end
+    self._serial_prefetch_next_at=nil
+    return self:download(b,opt,false,nil,true)
+end
+
+function Plugin:_serial_pending_extension_for(path)
+    local target=normalized_reader_file(path)
+    if not target or target=="" then return false end
+    for _,item in ipairs(self.store:pending_installs() or {}) do
+        if normalized_reader_file(item and item.file or "")==target then return true end
+    end
+    return false
+end
+
+function Plugin:_serial_reader_continue(book_id,r)
+    if self._serial_continue_active==true then return end
+    self._serial_continue_active=true
+    local path=r.path or (r.record and r.record.file)
+    self:status_toast("追读","后续章节已就绪，正在接入",3)
+    logger.info("[MiuRead][SerialRead] continue","book=",tostring(book_id))
+    self:return_to_miuread_home("serial read continue")
+    -- 返回首页后由 post-close 阶段安装待装扩展；装好后重开同一文件，
+    -- .sdr 阅读位置保持不变。
+    local tries=0
+    local function poll()
+        if self._serial_continue_active~=true then return end
+        tries=tries+1
+        self.store:reload()
+        if not self:_serial_pending_extension_for(path) then
+            self._serial_continue_active=false
+            if self:_active_reader_ui() then
+                self:status_toast("追读","后续章节已就绪，请重新打开书籍继续阅读",5)
+                return
+            end
+            self:_open_file_direct(path,"weread",book_id)
+            return
+        end
+        if tries>=20 then
+            self._serial_continue_active=false
+            self:status_toast("追读","后续章节已就绪，请重新打开书籍继续阅读",5)
+            return
+        end
+        UIManager:scheduleIn(.8,poll)
+    end
+    UIManager:scheduleIn(1.2,poll)
 end
 
 function Plugin:_chapter_state_text(book_id,chapter)
@@ -22500,6 +23069,12 @@ function Plugin:onReaderReady()
     -- ReaderUI already paints its first page. Avoid a second forced full-screen
     -- refresh, which was the visible extra flash after opening a book.
     self:_finish_page_transition(1.2,"reader first page")
+    UIManager:scheduleIn(2.0,function()
+        if not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
+            or reader_close_active() then return end
+        self:_schedule_serial_prefetch_check(true)
+    end)
     UIManager:scheduleIn(.05,function()
         if not (self.ui and self.ui.document)
             or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
@@ -22720,6 +23295,7 @@ function Plugin:onPageUpdate(page)
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
+        self:_schedule_serial_prefetch_check()
     end
 end
 function Plugin:_annotation_sync_preferences()
@@ -22962,6 +23538,26 @@ function Plugin:_reading_end_sync(reason,options,callback)
     return true
 end
 
+function Plugin:_serial_whole_book_percent(record,ratio)
+    -- 章节版/单章文件按全书目录换算整书进度；目录覆盖不到文件末章时
+    -- （历史短目录）返回 nil，调用方退回文件内比例。
+    local map=type(record and record.record and record.record.chapter_map)=="table"
+        and record.record.chapter_map or {}
+    if #map==0 then return nil end
+    local last_global=tonumber(map[#map] and map[#map].index) or 0
+    local book_id=tostring(record.book and (record.book.book_id or record.book.bookId) or "")
+    local book=book_id~="" and self.store:book(book_id) or nil
+    local full=type(book)=="table" and type(book.catalog)=="table" and book.catalog or {}
+    if #full<=#map then return nil end
+    if last_global>0 and #full<last_global then return nil end
+    local ok,position=pcall(self.sync.position,self.sync,record,ratio or 0,map)
+    if ok and type(position)=="table" then
+        local progress=tonumber(position.progress)
+        if progress then return math.max(0,math.min(100,math.floor(progress+.5))) end
+    end
+    return nil
+end
+
 function Plugin:_reading_end_detach_for_home(reason)
     reason=tostring(reason or "返回觅阅主页")
     if not self:_reader_session_is_weread() then return false end
@@ -23012,7 +23608,16 @@ function Plugin:_reading_end_detach_for_home(reason)
             self:_save_progress_state(book_id,"waiting_network",
                 "已保存本机阅读位置；等待网络后继续同步",nil,nil)
         else
-            local local_percent=ratio_snapshot and math.floor(U.clamp(ratio_snapshot,0,1)*100+.5) or nil
+            local local_percent
+            if ratio_snapshot then
+                local_percent=math.floor(U.clamp(ratio_snapshot,0,1)*100+.5)
+                -- 章节版/单章文件不能拿文件内比例当整书进度：先按全书目录换算。
+                local current_record=current.record or {}
+                if current_record.partial_range==true or tostring(current_record.chapter_uid or "")~="" then
+                    local mapped=self:_serial_whole_book_percent(current,ratio_snapshot)
+                    if mapped then local_percent=mapped end
+                end
+            end
             self:_save_progress_state(book_id,"deferred",
                 "本机位置已保存；正在后台定位最终精确坐标",local_percent,nil)
             local resolve_started,resolve_error=self.sync:resolve_local_progress(function(position,position_error,meta)
