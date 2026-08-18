@@ -17452,7 +17452,7 @@ end
 function Plugin:_serial_read_config()
     return {
         start_count=math.max(2,tonumber(Config.SERIAL_READ_START_CHAPTERS) or 5),
-        keep_ahead=math.max(1,tonumber(Config.SERIAL_READ_KEEP_AHEAD) or 3),
+        keep_ahead=math.max(1,tonumber(Config.SERIAL_READ_KEEP_AHEAD) or 4),
         batch=math.max(1,tonumber(Config.SERIAL_READ_EXTEND_BATCH) or 5),
         check_interval=math.max(3,tonumber(Config.SERIAL_READ_CHECK_INTERVAL) or 10),
     }
@@ -17709,6 +17709,21 @@ function Plugin:_serial_prefetch_check()
         return
     end
     local state=self.store:download_state()
+    if (state.status=="failed" or state.status=="interrupted")
+        and type(state.options)=="table" and state.options.auto_prefetch==true then
+        -- 追读扩展是可再生的后台任务：失败状态不能永久冻结追读（限频、
+        -- 网络抖动都会留下 failed 状态）。至多每 10 分钟自动清一次并重试；
+        -- 断点保留，重试只补缺失章节。
+        local now=os.time()
+        if now-(tonumber(self._serial_auto_fail_cleared_at) or 0)>=600 then
+            self._serial_auto_fail_cleared_at=now
+            logger.info("[MiuRead][SerialRead] clearing stale auto prefetch failure",
+                "book=",tostring(book_id),"status=",tostring(state.status))
+            self.store:clear_download_state()
+            self:_serial_notice("auto_retry",120,"追读","上次预下载未完成，正在重试（进度不会重复下载）")
+            state=self.store:download_state()
+        end
+    end
     if state.status=="active" or state.status=="failed" or state.status=="interrupted" then return end
     -- 唯一的等待位被占用时不抢占；本书已在等待则等它轮到即可。
     if #self.store:download_queue()>0 then return end
@@ -17736,6 +17751,7 @@ function Plugin:_serial_enqueue_extension(book_id,r,record,target_end,flags)
     }
     logger.info("[MiuRead][SerialRead] extend",
         "book=",tostring(book_id),"start=",tostring(start_index),"end=",tostring(target_end))
+    self:status_toast("追读","剩余章节不足，正在后台下载后续章节",3)
     local policy=tostring(self.store:preferences().download_reader_policy or "ask")
     if policy=="after_reading" and self:_active_reader_ui() then
         local queued=self.store:enqueue_download({

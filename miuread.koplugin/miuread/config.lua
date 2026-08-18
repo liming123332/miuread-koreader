@@ -204,10 +204,11 @@ local C = {
 
     -- 追读：阅读章节版/单章文件时自动向后预下载，无需手动指定范围。
     -- START_CHAPTERS 是开启追读时的起步下载量（含起始章）；KEEP_AHEAD 是
-    -- 文件内剩余可读章数低于该值时触发扩展；EXTEND_BATCH 是每次扩展在
-    -- 提前量之外多追加的章数；CHECK_INTERVAL 是阅读中检查的节流秒数。
+    -- 文件内剩余可读章数低于该值时触发扩展（提前触发给下载留出阅读缓冲）；
+    -- EXTEND_BATCH 是每次扩展在提前量之外多追加的章数；CHECK_INTERVAL
+    -- 是阅读中检查的节流秒数。
     SERIAL_READ_START_CHAPTERS = 5,
-    SERIAL_READ_KEEP_AHEAD = 3,
+    SERIAL_READ_KEEP_AHEAD = 4,
     SERIAL_READ_EXTEND_BATCH = 5,
     SERIAL_READ_CHECK_INTERVAL = 10,
     -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
