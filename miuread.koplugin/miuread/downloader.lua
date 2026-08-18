@@ -73,6 +73,10 @@ local INDENT_SAMPLE_LIMIT = 400
 local INDENT_WRAP_MAX_BYTES = 8 * 1024 * 1024
 
 local function wrap_indent_spaces(body)
+    -- 早期版本只把段首空格串里的第一个包进 span，剩余空格留在 span 外仍占宽，
+    -- 且 <p>+空格 的重包模式匹配不到这种旧状态，永远无法自愈。这里先把旧
+    -- span 拆回纯文本，再统一重包完整空格串，保证任何历史状态一次修齐。
+    body = body:gsub('<span class="miu%-lead">(' .. U3000 .. '*)</span>', "%1")
     local wrapped = 0
     local out
     out, wrapped = body:gsub("(<p>)(" .. U3000 .. "+)", function(open, spaces)
@@ -119,6 +123,9 @@ local function apply_paragraph_indent(chapters)
             local out, count = wrap_indent_spaces(body)
             if count > 0 then
                 wrapped = wrapped + count
+                if out == body then count = 0 end
+            end
+            if count > 0 then
                 if from_file then
                     local ok = U.atomic_write(chapter.body_path, out, true)
                     if not ok then
