@@ -17631,6 +17631,21 @@ function Plugin:_schedule_serial_prefetch_check(initial)
     UIManager:scheduleIn(initial==true and 2.0 or .4,function() self:_serial_prefetch_check() end)
 end
 
+function Plugin:_reader_at_document_end(ratio)
+    -- 末页的起始位置通常只到全文 98% 左右，比例阈值必须放宽；页码到
+    -- 最后一页是确定性判断（滚动模式退回比例判断）。
+    ratio=tonumber(ratio) or (self.sync:local_ratio() or 0)
+    if ratio>=0.98 then return true end
+    local doc=self.ui and self.ui.document
+    if doc and type(doc.getPageCount)=="function" and type(doc.getCurrentPage)=="function" then
+        local ok_p,total=pcall(doc.getPageCount,doc)
+        local ok_c,current=pcall(doc.getCurrentPage,doc)
+        if ok_p and ok_c and tonumber(total) and tonumber(current)
+            and tonumber(current)>=tonumber(total) then return true end
+    end
+    return false
+end
+
 function Plugin:_serial_prefetch_check()
     if self._serial_continue_active==true then return end
     if not (self.ui and self.ui.document) then return end
@@ -17662,7 +17677,8 @@ function Plugin:_serial_prefetch_check()
     local current_global=tonumber(map[idx] and map[idx].index) or idx
     local last_global=tonumber(map[#map] and map[#map].index) or #map
     local at_last_chapter=current_global>=last_global
-    if at_last_chapter and ratio>=0.995 and self:_serial_pending_extension_for(r.path or record.file) then
+    if at_last_chapter and self:_reader_at_document_end(ratio)
+        and self:_serial_pending_extension_for(r.path or record.file) then
         self:_serial_reader_continue(book_id,r)
         return
     end
